@@ -1,0 +1,794 @@
+#!/usr/bin/perl
+
+# $Id: build-apache,v 1.7 1999/11/23 20:17:34 jgsmith Exp $
+
+# Copyright (c) 1999, Texas A&M University
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+# 3. Neither the name of the University nor the names of its contributors
+#    may be used to endorse or promote products derived from this software
+#    without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTERS ``AS IS''
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE 
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE 
+# ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR CONTRIBUTORS BE 
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR 
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF 
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS 
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN 
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) 
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE 
+# POSSIBILITY OF SUCH DAMAGE.
+
+use strict;
+use Getopt::Std;
+use IniConf;
+use Net::FTP;
+use Sys::Hostname;
+use Cwd;
+
+my($iam,$ret,%opt);       # Program name and options processing
+my($USAGE, @ORIG_ARGV);   # For error reporting
+my($cfg_file, $cfg);      # File used for config items
+my(%paths);               # Various paths to components (after installation)
+my(%components);          # Components to install
+my(%utilities);           # various shell utilities to use
+my(%ftpsites);            # user configured sites for downloading
+my(%apachemodules);       # disposition of various apache modules
+my(%apache_modules_files);# location of the module in the Apache src tree
+my($olddir);              # original directory
+my(%apache_opts);         # apache options (env. variables)
+my(%php_opts);            # mod_php options
+my(%host);                # host options
+
+my(%defaultpaths) = (prefix  => '/usr/local',
+                     logdir  => '@prefix@/log',
+                     sbindir => '@prefix@/bin',
+                    );
+my(@cfg_paths) = (qw(prefix logdir sbindir));
+my(%defaultcomponents) = (apache   => 'latest',
+                          mod_ssl  => 'no',
+                          openssl  => '@mod_ssl@',
+                          rsaref   => 'no',
+                          mod_perl => 'no',
+                          mm       => 'no',
+                          mod_php  => 'no',
+                         );
+
+($iam = $0) =~ s,.*/,,;
+
+@ORIG_ARGV = @ARGV;
+
+$USAGE="Usage: $iam [-h] [-n] [-v|-s]  [-d dir] [-H|-f config file]\n";
+
+# do it now for use strict...
+sub _suicide {
+    my($error) = join($,, @_);
+
+    die "$iam: $error\n";
+}
+
+getopts('nsvhHd:f:', \%opt) or _suicide $USAGE;
+
+if($opt{'h'}) {
+    print STDERR <<1HERE1;
+
+$USAGE
+Option	Description
+-h	This help text
+
+-n	Not really - prints out what would happen if for real
+
+-v	Verbose
+-s	Silent
+
+-d	Build directory
+
+-H	Host build - uses <hostname>.conf as the configuration file
+-f	Specific configuration file to be used
+
+$iam will configure and build Apache with various modules.  
+See the default configuration file (apache.conf) or the sample configuration
+file (generic.conf) for available options.
+1HERE1
+    exit;
+}
+
+(defined($opt{'s'}) + defined($opt{'v'}) < 2) ||
+    _suicide "Please specify at most one of -v and -s\n";
+    
+(defined($opt{'f'}) + defined($opt{'H'}) < 2) ||
+    _suicide "Please specify at most one of -H and -f <config_file>\n";
+
+if($opt{'H'}) {
+    my $host = hostname or _suicide $@;
+    $host =~ /(^[^.]*)/;
+    my $dir = $1;
+    $opt{'f'} = "$dir.conf";
+}
+
+if($opt{'d'}) {
+    $olddir = cwd;
+    chdir($opt{'d'}) or _suicide "Unable to chdir to $opt{'d'}: $!\n";
+} else {
+    $olddir = cwd;
+}
+
+$opt{'f'} =~ m{([^/]*?)(\.[^/]*)?$};
+$opt{'H'} = "$1$$";
+mkdir $opt{'H'}, 0755 unless -e $opt{'H'} && -d _;
+opendir OD, $olddir;
+foreach my $f (grep /\.tar/, (readdir(OD))) {
+    symlink "$olddir/$f", "$opt{'H'}/$f" or _suicide "Unable to create link ($f): $!\n";
+}
+symlink "$olddir/$opt{'f'}", "$opt{'H'}/$opt{'f'}" or _suicide "Unable to create link ($opt{'f'}): $!\n";
+chdir $opt{'H'};
+
+$cfg_file = $opt{'f'} || 'apache.conf';
+
+-e $cfg_file or _suicide "$cfg_file does not exist\n";
+
+$cfg = new IniConf -file => $cfg_file;
+
+# we don't want to cache the stdout for this stuff
+select((select(STDOUT), $| = 1)[0]);
+
+print "\nReading host configuration...\n" unless $opt{'s'};
+
+foreach my $k (qw/build host target/) {
+  $host{$k} = $cfg->val('host', $k);
+}
+
+print "\nReading components...\n" unless $opt{'s'};
+
+foreach my $k (keys %defaultcomponents) {
+    if($components{$k} = $cfg->val('components', $k)) {
+        foreach my $i ($components{$k} =~ m/\@(.*?)\@/g) {
+            $components{$k} =~ s{\@$i\@}{$components{$i}}g;
+        }
+        print "$k = $components{$k}\n" if($opt{'v'});
+    } else {
+        $components{$k} = $defaultcomponents{$k};
+        foreach my $i ($components{$k} =~ m/\@(.*?)\@/g) {
+            $components{$k} =~ s{\@$i\@}{$components{$i}}g;
+        }
+        print "$k defaulting to $components{$k}\n" unless $opt{'s'};
+    }
+    delete $ftpsites{$k} unless($ftpsites{$k} = $cfg->val('sites', $k));
+}
+
+print "\nChecking component dependencies...\n" unless $opt{'s'};
+
+if($components{'mod_perl'} ne 'no' && $components{'apache'} eq 'no') {
+    $components{'apache'} = 'latest';
+    print "mod_perl requires apache\napache defaulting to latest\n" unless $opt{'s'};
+}
+
+if($components{'mod_ssl'} ne 'no' && $components{'apache'} eq 'no') {
+    $components{'apache'} = 'latest';
+    print "mod_ssl requires apache\napache defaulting to latest\n" unless $opt{'s'};
+}
+
+if($components{'mod_ssl'} ne 'no' && $components{'openssl'} eq 'no') {
+    $components{'openssl'} = 'latest';
+    print "mod_ssl requires openssl\nopenssl defaulting to latest\n" unless $opt{'s'};
+}
+
+if($components{'openssl'} ne 'no' && $components{'openssl'} ne 'system'
+       && $components{'rsaref'} eq 'no') 
+    {
+    my $country = $cfg->val('local', 'country');
+    $country or _suicide "country must be defined under [local]\n";
+    if($country eq 'us') {
+        print "openssl requires rsaref in the US\nrsaref defaulting to latest\n" unless $opt{'s'};
+    }
+}
+
+if($components{'mod_php'} ne 'no' && $components{'apache'} eq 'no') {
+    $components{'apache'} = 'latest';
+    print "mod_php requires apache\napache defaulting to latest\n" unless $opt{'s'};
+}
+
+if($components{'mod_php'} ne 'no') {
+    push @cfg_paths, qw();
+
+    print "\nReading mod_php configuration...\n" unless $opt{'s'};
+    
+}
+
+if($components{'mod_perl'} ne 'no') {
+    push @cfg_paths, qw();
+}
+
+if($components{'openssl'} ne 'no' && $components{'openssl'} ne 'system') {
+    push @cfg_paths, qw(opensslprefix openssldir);
+    $defaultpaths{'opensslprefix'} = '@prefix@';
+    $defaultpaths{'openssldir'} = '@opensslprefix@/openssl';
+}
+
+if($components{'mod_ssl'} ne 'no') {
+    push @cfg_paths, qw(modsslservercrt modsslserverkey);
+    $defaultpaths{'modsslservercrt'} = '';
+    $defaultpaths{'modsslserverkey'} = '@modsslservercrt@';
+}
+
+if($components{'apache'} ne 'no') {
+  print "\nReading Apache options...\n" unless $opt{'s'};
+  foreach my $k (qw/cflags ldflags extra_libs/) {
+    my $r = $cfg->val('apache', $k);
+    $apache_opts{$k} = $r if $r !~ /^\s*$/;
+  }
+}
+
+print "\nReading paths...\n" unless $opt{'s'};
+
+foreach my $k (@cfg_paths) {
+    if($paths{$k} = $cfg->val('paths', $k)) {
+        foreach my $i ($paths{$k} =~ m/\@(.*?)\@/g) {
+            $paths{$k} =~ s{\@$i\@}{$paths{$i}}g;
+        }
+        print "$k = $paths{$k}\n" if($opt{'v'});
+    } else {
+        $paths{$k} = $defaultpaths{$k};
+        foreach my $i ($paths{$k} =~ m/\@(.*?)\@/g) {
+            $paths{$k} =~ s{\@$i\@}{$paths{$i}}g;
+        }
+        print "$k defaulting to $paths{$k}\n" unless $opt{'s'};
+    }
+}
+
+print "\nReading utilities...\n" unless $opt{'s'};
+
+my $joiner = ':';
+$joiner = ' ' if($ENV{'PATH'} =~ /\s/);
+$ENV{'PATH'} = join($joiner, $ENV{'PATH'}, split(/:/, $cfg->val('paths', 'path'))); 
+
+my(@path) = split(/:|\s/, $ENV{'PATH'});
+foreach my $k (qw(tar gzip make sh perl ar)) {
+    if($utilities{$k} = $cfg->val('utilities', $k)) {
+        print "$k - $utilities{$k}\n" if($opt{'v'});
+    } else {
+        $utilities{$k} = 'auto';
+    }
+    if($utilities{$k} eq 'auto') {
+        foreach my $p (@path) {
+            if(-e "$p/$k" and -x _ and not -d _) {
+                $utilities{$k} = "$p/$k";
+                print "$k defaulting to $utilities{$k}\n" unless $opt{'s'};
+                last;
+            }
+        }
+        $utilities{$k} ne 'auto' || _suicide "unable to find $k in path\n";
+    }
+}
+
+# Get the version of mod_ssl and apache we are going to use.  Start with
+# mod_ssl, since it is specific to the version of apache...
+if($components{'mod_ssl'} ne 'no') {
+    print "\nSanity checking and downloading mod_ssl...\n" unless $opt{'s'};
+    my $ftp = &ftp_connect('mod_ssl', 'ftp.modssl.org' => '/source/');
+    $ftp || _suicide "Unable to retrieve mod_ssl\n";
+    my @versions = map { (/^mod_ssl-(.*)\.tar\.gz$/) } grep(/^mod_ssl.*\.tar\.gz$/, $ftp->ls);
+    my %modsslversions;
+    foreach my $version (@versions) {
+        my($k, $v) = split(/-/, $version, 2);
+        next if $k =~ /b/;   # skip betas
+        $modsslversions{$k} = $v;
+    }
+
+    if($components{'mod_ssl'} ne 'latest' and 
+       not defined $modsslversions{$components{'mod_ssl'}})
+    {
+        print "modssl $components{'mod_ssl'} does not exist - defaulting to latest\n" if not $opt{'s'};
+        $components{'mod_ssl'} = 'latest';
+    }
+
+    if($components{'mod_ssl'} eq 'latest') {
+        my $v = (sort triple_version_cmp keys %modsslversions)[0];
+        $components{'mod_ssl'} = $v;
+    }
+
+    if($components{'apache'} ne $modsslversions{$components{'mod_ssl'}}) {
+        print "apache $components{'apache'} does not match the version required by mod_ssl\ndefaulting to $modsslversions{$components{'mod_ssl'}}\n" unless $opt{'s'};
+        $components{'apache'} = $modsslversions{$components{'mod_ssl'}};
+    }
+
+    my $filename = "mod_ssl-" . $components{'mod_ssl'} . "-"
+                              . $components{'apache'} . ".tar.gz";
+
+    if(-e $filename) {
+        print "you already have $filename\n" if $opt{'v'};
+    } else {
+        print "downloading $filename...\n" if $opt{'v'};
+    }
+
+    unless($opt{'n'} || -e $filename) {
+        $ftp->get($filename) || _suicide "Unable to retrieve $filename\n";
+    }
+
+    $ftp->quit;
+}
+
+# on to openssl...
+&get_component('openssl', 3,
+               'ftp.openssl.org' => 'source');
+
+# on to mm...
+&get_component('mm', 3,
+               'ftp.engelschall.com' => '/sw/mm/');
+
+# on to rsaref
+&get_component('rsaref', 2,
+               'ftp.relay.com' => '/pub/crypto/crypto/LIBS/rsa/',
+               'utopia.hacktic.nl' => '/pub/replay/pub/crypto/LIBS/rsa/');
+
+# on the mod_perl
+&get_component('mod_perl', 2,
+               'ftp.cs.colorado.edu'
+                   => '/pub/perl/CPAN/modules/by-module/Apache',
+               'cpan.nas.nasa.gov'
+                   => '/pub/perl/CPAN/modules/by-module/Apache',
+               'ftp.cdrom.com'
+                   => '/pub/perl/CPAN/modules/by-module/Apache');
+
+# on to mod_php
+&get_component('mod_php', 3,
+               'us.php.net' => '/pub/distributions',
+               'uk.php.net' => '',
+              );
+
+# on to apache
+&get_component('apache', 2,
+               'ftp.digex.net' => '/pub/packages/network/apache/',
+               'ftp.missouri.edu' => '/pub/apache/dist/',
+               'ftp.tux.org' => '/pub/net/apache/',
+              );
+
+# unpack sources...
+if($opt{'v'}) {
+    $utilities{'tar'} .= ' xvf';
+} else {
+    $utilities{'tar'} .= ' xf';
+}
+
+if($components{'apache'} ne 'no') {  # JIC
+    &unpack("apache_$components{'apache'}.tar.gz");
+}
+
+if($components{'mod_ssl'} ne 'no') {
+    &unpack("mod_ssl-$components{'mod_ssl'}-$components{'apache'}.tar.gz");
+}
+
+if($components{'mm'} ne 'no' && $components{'mm'} ne 'system') {
+    &unpack("mm-$components{'mm'}.tar.gz");
+}
+
+if($components{'openssl'} ne 'no' && $components{'openssl'} ne 'system') {
+    &unpack("openssl-$components{'openssl'}.tar.gz");
+}
+
+if($components{'rsaref'} ne 'no') {
+    print "\nrsaref support is not completed yet...\n";
+    $components{'rsaref'} = 'no';
+}
+
+if($components{'mod_perl'} ne 'no') {
+    &unpack("mod_perl-$components{'mod_perl'}.tar.gz");
+}
+
+if($components{'mod_php'} ne 'no') {
+    &unpack("php-$components{'mod_php'}.tar.gz");
+
+    # get mod_php options from config file
+    # wrong OO programming: $cfg->{Config}->{$sect}->{$param}
+    if(ref($cfg->{Config}->{php}) eq 'HASH') {
+    }
+}
+
+# figure out what to do with the various apache modules in the source tree
+if($components{'apache'} ne 'no') { # JIC
+    my @modules;
+    my $dso;
+
+    if(defined $cfg->val("apache modules", "extramodulesdir")) {
+        my $dir = $cfg->val("apache modules", "extramodulesdir");
+        opendir OD, $dir;
+        map { symlink("$dir/$_", "apache_$components{'apache'}/src/modules/extra/$_") }
+            grep /\.[ch]$/, readdir OD;
+        closedir OD;
+    }
+
+    foreach my $d (qw(standard experimental proxy extra)) {
+        opendir OD, "apache_$components{'apache'}/src/modules/$d";
+        foreach my $f (grep /\.c$/, readdir OD) {
+          my($m) = ($f =~ /mod_(.*)\.c/);
+          push @modules, $m;
+          $apache_modules_files{$m} = "src/modules/$d/$f";
+        }
+        #push @modules, map { (/mod_(.*)\.c/) } grep /\.c$/, readdir OD;
+        closedir OD;
+    }
+
+    foreach my $m (@modules) {
+        $apachemodules{$m} = $cfg->val("apache modules", $m) || 'auto';
+        $dso++ if $apachemodules{$m} eq 'shared';
+    }
+    $apachemodules{'so'} = 'yes' if($dso and ($apachemodules{'so'} eq 'auto'
+                                          or  $apachemodules{'so'} eq 'no'));
+}
+
+if($components{'openssl'} ne 'no' && $components{'openssl'} ne 'system') {
+    my $config = "$utilities{'sh'} config --prefix=$paths{'opensslprefix'} --openssldir=$paths{'openssldir'}";
+
+    foreach my $k (qw/build target host/) {
+      $config .= " --$k=$host{$k}" if $host{$k};
+    }
+
+    &build('openssl', "openssl-$components{'openssl'}", $config,
+           qw(config clean build));
+}
+
+if($components{'mm'} ne 'no' && $components{'mm'} ne 'system') {
+    my $config = "$utilities{'sh'} configure --disable-shared";
+
+    foreach my $k (qw/build target host/) {
+      $config .= " --$k=$host{$k}" if $host{$k};
+    }
+
+    &build('mm', "mm-$components{'mm'}", $config, qw(config clean build));
+}
+
+if($components{'mod_ssl'} ne 'no') {
+    my $config = "$utilities{'sh'} configure --with-apache=../apache_$components{'apache'}";
+
+    if($paths{'modsslservercrt'}) {
+        $config .= " --with-crt=$paths{'modsslservercrt'} --with-key=$paths{'modsslserverkey'}";
+    }
+
+    foreach my $k (qw/build target host/) {
+      $config .= " --$k=$host{$k}" if $host{$k};
+    }
+
+    if($components{'openssl'} eq 'system') {
+        $config .= " --with-openssl=SYSTEM";
+    } else {
+        $config .= " --with-openssl=../openssl-$components{'openssl'}";
+    }
+
+    if($components{'mm'} eq 'system') {
+        $config .= " --with-mm=SYSTEM";
+    } elsif($components{'mm'} ne 'no') {
+        $config .= " --with-mm=../mm-$components{'mm'}";
+    }
+
+    $config .= " --prefix=$paths{'prefix'}";
+
+    &build('mod_ssl', "mod_ssl-$components{'mod_ssl'}-$components{'apache'}",
+           $config, qw(config));
+}
+
+if($components{'mod_perl'} ne 'no') {
+    my $config = "$utilities{'perl'} Makefile.PL ";
+
+    $config .= " EVERYTHING=1 APACHE_SRC=../apache_$components{'apache'}/src";
+    $config .= " USE_APACI=1 PREP_HTTPD=1 DO_HTTPD=1 ";
+    $config .= " PREFIX=$paths{'modperlprefix'}" if $paths{'modperlprefix'};
+
+    foreach my $k (qw/build target host/) {
+      $config .= " --$k=$host{$k}" if $host{$k};
+    }
+
+    &build('mod_perl', "mod_perl-$components{'mod_perl'}", $config, 
+           qw(config build install));
+} 
+
+if($components{'mod_php'} ne 'no') {
+    # we need to preconfigure apache with paths
+    my $config = "$utilities{'sh'} configure --prefix=$paths{'prefix'}";
+
+    $config .= " --logfiledir=$paths{'logdir'}";
+    $config .= " --sbindir=$paths{'sbindir'}";
+
+    foreach my $k (qw/build target host/) {
+      $config .= " --$k=$host{$k}" if $host{$k};
+    }
+    &build('apache', "apache_$components{'apache'}", $config,
+           qw(config));
+
+    # now configure mod_php
+    $config = "$utilities{'sh'} configure ";
+    $config .= "--with-apache=../apache_$components{'apache'}";
+
+    foreach my $k (qw/build target host/) {
+      $config .= " --$k=$host{$k}" if $host{$k};
+    }
+
+    foreach my $d (@{$php_opts{'databases'}}) {
+      if(defined $php_opts{$d}) {
+        $config .= " --with-$d=$php_opts{$d}";
+      } else {
+        $config .= " --with-$d";
+      }
+    }
+    if(defined $php_opts{cflags}) {
+      $config = "CFLAGS=\"$php_opts{cflags}\" $config";
+    }
+    if(defined $php_opts{ldflags}) {
+      $config = "LDFLAGS=\"$php_opts{ldflags}\" $config";
+    }
+    if(defined $php_opts{custom_odbc_libs}) {
+      $config = "CUSTOM_ODBC_LIBS=\"$php_opts{custom_odbc_libs}\" $config";
+    }
+
+    foreach my $d (@{$php_opts{'components'}}) {
+      if($d eq 'x') {
+        if(defined $php_opts{x}) {
+          $config .= " --with-x";
+          if($php_opts{x} || defined $php_opts{x_include}) {
+            my $xinc = $php_opts{x_include} || ($php_opts{x} . '/include');
+            $config .= " --x-includes=$xinc";
+          }
+          if($php_opts{x} || defined $php_opts{x_lib}) {
+            my $xlib = $php_opts{x_lib} || ($php_opts{x} . '/lib');
+            $config .= " --x-libraries=$xlib";
+          }
+        }
+        next;
+      }
+      if(defined $php_opts{$d}) {
+        $config .= " --with-$d=$php_opts{$d}";
+      } else {
+        $config .= " --with-$d";
+      }
+    }
+
+    foreach my $d (qw/gd pcre-regex posix/) {
+      $config .= " --without-$d" unless defined $php_opts{$d};
+    }
+
+    #enable/disable stuff
+    
+    foreach my $d (qw/maintainer-mode freetype-4bit-antialias-hack/,
+                   qw/t1lib debug safe-mode track-vars magic-quotes/,
+                   qw/debugger force-cgi-redirect discard-path/,
+                   qw/memory-limit sysvsem sysvshm dmalloc/,
+                   qw/ucd-snmp-hack unified-odbc bcmath short-tags/,
+                   qw/url-fopen-wrapper display-source/,
+    ) {
+      $config .= " --enable-$d" if $php_opts{$d} =~ /^yes$/i;
+      $config .= " --disable-$d" if $php_opts{$d} =~ /^no$/i;
+    }
+
+    
+    &build('mod_php', "php-$components{'mod_php'}", $config,
+           qw(config build install));
+}
+
+
+if($components{'apache'} ne 'no') { # JIC
+    my $config = "$utilities{'sh'} configure --prefix=$paths{'prefix'}";
+
+    $config .= " --logfiledir=$paths{'logdir'}";
+    $config .= " --sbindir=$paths{'sbindir'}";
+
+    foreach my $k (keys %apache_opts) {
+      $config = "\U$k\E=\"$apache_opts{$k}\" $config";
+    }
+
+    foreach my $k (qw/build target host/) {
+      $config .= " --$k=$host{$k}" if $host{$k};
+    }
+
+    if($components{'mod_ssl'} ne 'no') {
+        if($components{'openssl'} eq 'system') {
+            $config = "SSL_BASE=SYSTEM " . $config;
+        } elsif($components{'openssl'} ne 'no') { # JIC
+            $config = "SSL_BASE=../openssl-$components{'openssl'} " . $config;
+        }
+        if($components{'mm'} eq 'system') {
+            $config = "EAPI_MM=SYSTEM " . $config;
+        } elsif($components{'mm'} ne 'no') {
+            $config = "EAPI_MM=../mm-$components{'mm'} " . $config;
+        }
+
+        $config .= " --enable-module=ssl";
+    }
+
+    if($components{'mod_perl'} ne 'no') {
+        $config .= " --activate-module=src/modules/perl/libperl.a --enable-module=perl";
+    }
+    if($components{'mod_php'} ne 'no') {
+        my $version = ($components{'mod_php'} =~ /^(\d+)/)[0];
+        $config .= " --activate-module=src/modules/php$version/libphp$version.a --enable-module=php$version";
+    }
+
+    foreach my $m (keys %apachemodules) {
+        if($apachemodules{$m} eq 'no') {
+            $config .= " --disable-module=$m";
+        } elsif($apachemodules{$m} eq 'yes') {
+            if($apache_modules_files{$m} =~ m{/extra/}) {
+              my $f = $apache_modules_files{$m};
+              $f =~ s/\.c$/\.o/;
+              $config .= " --activate-module=$f";
+            } else {
+              $config .= " --enable-module=$m";
+            }
+        } elsif($apachemodules{$m} eq 'shared') {
+            $config .= " --enable-shared=$m";
+        } elsif($apachemodules{$m} eq 'not-shared') {
+            $config .= " --disable-shared=$m";
+        } 
+    }
+
+    if($apachemodules{'so'} eq 'max') {
+        $config .= " --enable-shared=max";
+    }
+
+    &build('apache', "apache_$components{'apache'}", $config,
+           qw(config clean build install));
+}
+
+if($opt{'H'}) {
+    # we need to clean up
+    # chdir './../';
+    # system "rm -rf $opt{'H'}" unless $opt{'H'} =~ m{/};
+    chdir $olddir;
+    print "\nBuild complete in $opt{'H'}\n";
+}
+
+sub build {
+    my($module) = shift;
+    my($dir) = shift;
+    my($config) = shift;
+    my(%parts);
+
+    foreach my $k (@_) {
+        $parts{$k}++;
+    }
+
+    my $cmd = "cd $dir";
+
+    if($parts{'config'}) {
+        print "$cmd; $config\n";
+        $ret = system "$cmd && $config" unless $opt{'n'};
+        $ret && _suicide "Unable to configure $module\n";
+    }
+
+    if($parts{'clean'}) {
+        print " && $utilities{'make'} clean";
+        $ret = system "$cmd && $utilities{'make'} clean" unless $opt{'n'};
+        $ret && _suicide "Unable to clean the build directory for $module\n";
+    }
+
+    if($parts{'build'}) {
+        print " && $utilities{'make'}";
+        $ret = system "$cmd && $utilities{'make'}" unless $opt{'n'};
+        $ret && _suicide "Unable to make $module\n";
+    }
+
+    if($parts{'install'}) {
+        print " && $utilities{'make'} install";
+        $ret = system "$cmd && $utilities{'make'} install" unless $opt{'n'};
+        $ret && _suicide "Unable to install $module\n";
+    }
+
+    print "\n";
+}
+
+
+sub unpack {
+    my $filename = shift;
+
+    print "\nUnpacking $filename...\n" unless $opt{'s'};
+    unless($opt{'n'}) {
+        $ret = system "$utilities{'gzip'} -d -c $filename | $utilities{'tar'} -";
+        $ret && _suicide "Unable to untar $filename\n";
+    }
+}
+
+sub get_component {
+    my $component = shift;
+    my $versions = shift;
+    my(@sites) = @_;
+
+    return if($components{$component} eq 'no' 
+           || $components{$component} eq 'system');
+
+    print "\nDownloading $component...\n" unless $opt{'s'};
+    my $ftp = &ftp_connect($component, @sites);
+    $ftp || _suicide "Unable to retrieve $component\n";
+
+    my $compname = $component;
+    $compname = 'php' if $component eq 'mod_php';
+
+    my %modperlversions = map { ($_ => 1) } 
+                              map { (/(\d.*)\.tar\./) }
+                                  grep(/$compname/ && /\d.*\.tar\./, $ftp->ls);
+
+    if($opt{'v'}) {
+      print "Versions available: <", join("><", keys %modperlversions), ">\n";
+      print join("\n", $ftp->ls), "\n";
+    }
+
+    if($components{$component} ne 'latest' and 
+           not defined $modperlversions{$components{$component}}) 
+    {
+        print "$component $components{$component} does not exist - defaulting to latest\n" if not $opt{'s'};
+        $components{$component} = 'latest';
+    }
+        
+    if($components{$component} eq 'latest') {
+        if($versions == 2) {
+            $components{$component} = (sort { $a <=> $b } keys %modperlversions)[-1];
+        } else {
+            $components{$component} = (sort triple_version_cmp keys %modperlversions)[0];
+        }
+    }
+    
+    my $filename;
+
+    if($component eq 'rsaref') {
+        $filename = "$compname$components{$component}.tar.Z";
+    } elsif($component eq 'apache') {
+        $filename = "$compname\_$components{$component}.tar.gz";
+    } else {
+        $filename = "$compname-$components{$component}.tar.gz";
+    }
+
+    if(-e $filename) {
+        print "you already have $filename\n" if $opt{'v'};
+    } else {
+        print "downloading $filename...\n" if $opt{'v'};
+    }
+
+    unless($opt{'n'} || -e $filename) {
+        $ftp->get($filename) || _suicide "Unable to retrieve $filename\n";
+    }
+
+    $ftp->quit;
+}
+    
+sub triple_version_cmp {
+    my(@aa) = ($a =~ /(\d+)\.(\d+)\.(\d+)([a-z]*)/i);
+    my(@bb) = ($b =~ /(\d+)\.(\d+)\.(\d+)([a-z]*)/i);
+
+    return - ($aa[0] <=> $bb[0]
+                  or
+           $aa[1] <=> $bb[1]
+                  or
+           $aa[2] <=> $bb[2]
+                  or
+           $aa[3] cmp $bb[3]
+                  ) ;
+}
+
+sub ftp_connect {
+    my($component) = shift;
+    my(%sites) = @_;
+    my(%usites);
+
+    if($ftpsites{$component}) {
+        %usites = split(/:|,/, $ftpsites{$component})
+    }
+
+    foreach my $site (keys %usites, keys %sites) {
+        print "Trying $site...\n" if $opt{'v'};
+        my $ftp = new Net::FTP($site);
+        return $ftp if $ftp 
+                       && $ftp->login("anonymous", 'me@here.now.com') 
+                       && $ftp->cwd($usites{$site} || $sites{$site})
+                       && $ftp->binary;
+        $ftp && $ftp->quit;
+    }
+    return undef;
+}
+

@@ -1,0 +1,23 @@
+This is the build-apache script with a generic.conf configuration file.
+
+This is not currently being maintained, but if you have patches for bugs or
+improvements, send them to jsmith@cpan.org.  If there is an interest in it
+being maintained, the fixes will be incorporated and a new tar file
+rolled.
+
+
+Some or all of the following might be standard Perl modules.  They are all
+required for the script to work.
+
+   Cwd
+   Getopt::Std
+   IniConf
+   Net::FTP
+   Sys::Hostname
+
+See comments in the generic.conf file for configuration directions.
+
+build-apache will try to download all the pieces of software required to
+build apache with mod_perl, mod_php, and mod_ssl (depending on the
+configuration).  Some of the locations may be stale.  Feel free to update
+or e-mail corrections.
